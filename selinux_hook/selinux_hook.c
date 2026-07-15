@@ -623,11 +623,17 @@ static ssize_t patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
     return ret;
 }
 
+/*
+ * Freestanding KPM images cannot rely on out-of-line memcpy()/memset().
+ * Even with -fno-builtin, clang/gcc may lower structure assignment and
+ * bulk copies to libcalls under -O2.  Keep these helpers as volatile byte
+ * walks so optimized builds never emit unresolved memcpy/memset relocs.
+ */
 static void copy_bytes(void *dst, const void *src, size_t len)
 {
     size_t i;
-    char *d = (char *)dst;
-    const char *s = (const char *)src;
+    volatile char *d = (volatile char *)dst;
+    const volatile char *s = (const volatile char *)src;
 
     if (!d || !s)
         return;
@@ -646,6 +652,19 @@ static void zero_bytes(void *dst, size_t len)
 
     for (i = 0; i < len; i++)
         d[i] = 0;
+}
+
+/* Field-wise av_decision copy: avoid *dst = *src which becomes memcpy@plt. */
+static void copy_av_decision(struct av_decision *dst, const struct av_decision *src)
+{
+    if (!dst || !src)
+        return;
+
+    dst->allowed = src->allowed;
+    dst->auditallow = src->auditallow;
+    dst->auditdeny = src->auditdeny;
+    dst->seqno = src->seqno;
+    dst->flags = src->flags;
 }
 
 static int copy_status_to_user(void __user *dst, const void *src, size_t len)
@@ -2738,7 +2757,8 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
                                             tclass, &clean_avd, xperms)) {
             clean_avd.seqno = SELINUX_STATUS_CLEAN_SEQUENCE;
             clean_avd.flags = avd->flags;
-            *avd = clean_avd;
+            /* Do not use *avd = clean_avd: -O2 lowers it to memcpy. */
+            copy_av_decision(avd, &clean_avd);
             a->skip_origin = 1;
             return;
         }
@@ -2771,9 +2791,14 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     u32 n;
     uid_t uid;
 
+    /* KernelPatch transit leaves hook_local uninitialized.  data3 marks
+     * clean-eval scope ownership for after_sel_write_common(); garbage here
+     * makes optimized builds leave a scope that was never entered and can
+     * corrupt g_clean_eval_scopes / g_clean_eval_depth under 5.10/6.12 load. */
     a->local.data0 = 0;
     a->local.data1 = 0;
     a->local.data2 = 0;
+    a->local.data3 = 0;
 
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
@@ -2911,9 +2936,11 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     u32 n;
     uid_t uid;
 
+    /* Same as access: data3 is the clean-eval enter flag; must start at 0. */
     a->local.data0 = 0;
     a->local.data1 = 0;
     a->local.data2 = 0;
+    a->local.data3 = 0;
 
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);

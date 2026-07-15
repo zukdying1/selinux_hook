@@ -23,19 +23,33 @@ else ifdef NDK_PATH
     LD := $(NDK_PATH)/ld.lld
 endif
 
-CFLAGS = -Wall -O0 \
-    -fno-inline \
+# Default -O2 is safe after the freestanding-safe copy helpers and
+# hook_local.data3 initialization fixes.  Keep -fno-builtin so ordinary
+# C library names are never assumed; structure copies still must not
+# rely on compiler-emitted memcpy (see copy_bytes/copy_av_decision).
+# Override with `make OPT_LEVEL=0` if a toolchain still miscompiles.
+OPT_LEVEL ?= 2
+
+CFLAGS = -Wall -O$(OPT_LEVEL) \
+    -fno-builtin \
     -fno-vectorize \
     -fno-slp-vectorize \
-    -fno-builtin \
     -fno-stack-protector \
     -fno-pic \
     -fno-pie \
     -fno-asynchronous-unwind-tables \
     -fno-unwind-tables \
     -fno-strict-aliasing \
+    -ffunction-sections \
+    -fdata-sections \
     -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
 CFLAGS += -std=gnu99
+
+# Extra safety on clang freestanding builds: never emit libcalls for
+# compiler-generated block moves if the option is available.
+ifeq ($(findstring clang,$(notdir $(CC))),clang)
+CFLAGS += -fno-builtin-memcpy -fno-builtin-memset -fno-builtin-memmove
+endif
 
 INCLUDE_DIRS := . include patch/include linux linux/include linux/security/selinux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
