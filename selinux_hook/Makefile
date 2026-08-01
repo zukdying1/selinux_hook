@@ -34,8 +34,8 @@ OPT_LEVEL ?= 2
 
 CFLAGS = -Wall -O$(OPT_LEVEL) \
     -fno-builtin \
-    -fno-vectorize \
-    -fno-slp-vectorize \
+    -fno-tree-vectorize \
+    -fno-tree-slp-vectorize \
     -fno-stack-protector \
     -fno-pic \
     -fno-pie \
