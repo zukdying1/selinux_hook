@@ -25,7 +25,7 @@
 #include <kputils.h>
 
 KPM_NAME("selinux_MAF_fork");
-KPM_VERSION("1.1.4");
+KPM_VERSION("1.1.7.2");
 KPM_LICENSE("GPL v3");
 KPM_AUTHOR("Admire, 741afb7");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
@@ -51,7 +51,6 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
-
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
 typedef enum {
@@ -64,6 +63,8 @@ typedef enum {
 static bool g_hook_context_compute_av_ok; // Legacy AV hook attachment status flag, used to identify the working mode
 
 static void *g_funcs[24];
+static void *g_hook_befores[24];
+static void *g_hook_afters[24];
 static int g_hooks;
 struct file;
 typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
@@ -400,9 +401,8 @@ static void (*type_attribute_bounds_av_fn)(struct policydb *policydb,
                                            struct av_decision *avd);
 static void (*selinux_policy_cancel_fn)(struct selinux_load_state *load_state);
 static void (*selinux_policy_cancel_compat_fn)(void *state, struct selinux_load_state *load_state);
-struct sidtab;
-static void (*sidtab_cancel_convert_fn)(struct sidtab *sidtab);
 static void *(*vmalloc_fn)(unsigned long size);
+static void *(*vmalloc_to_page_fn)(const void *addr);
 static void (*vfree_fn)(const void *addr);
 static struct file *(*filp_open_fn)(const char *filename, int flags, umode_t mode);
 static int (*filp_close_fn)(struct file *filp, fl_owner_t id);
@@ -421,7 +421,6 @@ static bool g_clean_policy_has_magisk;
 static struct selinux_load_state g_clean_load_state;
 static bool g_clean_load_state_ready;
 static bool g_clean_policydb_direct;
-static bool g_clean_sidtab_convert_canceled;
 static void *g_clean_policydb;
 static void *g_first_policy;
 static size_t g_policydb_offset;
@@ -429,14 +428,6 @@ static u32 g_clean_eval_depth;
 static u32 g_bypass_access_log_count;
 static u32 g_bypass_context_log_count;
 
-/* Cached vmalloc copy of g_clean_policy_blob shared by every reader.
- * Snapshot runs once at module init, so the source pointer is effectively
- * immutable — the cache is reused on every hit and only re-vmalloc'd when
- * the source pointer changes.  Guarded by g_policy_cache_lock. */
-static void *g_policy_read_cache;
-static size_t g_policy_read_cache_len;
-static void *g_policy_read_cache_src;
-static raw_spinlock_t g_policy_cache_lock = { .raw_lock = ATOMIC_INIT(0) };
 static u32 g_bypass_policy_log_count;
 static u32 g_internal_policy_load_depth;
 static u32 g_procattr_current_count;
@@ -472,6 +463,8 @@ static struct access_probe g_probes[ACCESS_PROBE_SLOTS];
 static struct clean_eval_scope g_clean_eval_scopes[CLEAN_EVAL_SCOPE_SLOTS];
 static struct status_read_scope g_status_read_scopes[STATUS_READ_SCOPE_SLOTS];
 static unsigned char g_clean_status_bytes[SELINUX_STATUS_SIZE];
+static void *g_fake_status_page;
+static bool g_status_page_redirect_hooked;
 
 /* Spinlock guards for the scope arrays.  We do not use DEFINE_SPINLOCK +
  * spin_lock() because the running kernel on this device does not export
@@ -497,15 +490,14 @@ static int clean_policy_context_to_sid(const char *query, u32 *out_sid);
 static void refresh_clean_policydb(const char *reason, bool allow_fallback);
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
-static bool current_is_policy_manager(void);
 static bool should_log_live_bypass(uid_t uid);
 static void log_bypass_once(const char *node, uid_t uid, const char *query);
-static void cancel_clean_sidtab_convert(const char *reason);
 static bool use_clean_blob_route(void);
 static bool use_legacy_clean_blob_query(void);
 static bool selinux_49_compat_path(void);
 static bool selinux_414_compat_path(void);
 static bool clean_policydb_redirect_supported(void);
+static bool selinux_state_arg_required(void);
 static bool selinux_compat_call_needed(void);
 static bool policydb_offset_fallback_allowed(void);
 static bool write_op_slot_fallback_allowed(void);
@@ -516,7 +508,6 @@ static void log_symbol_addr(const char *name, const void *addr);
 static void zero_bytes(void *dst, size_t len);
 static int call_security_load_policy(void *data, size_t len, struct selinux_load_state *load_state);
 static void call_selinux_policy_cancel(struct selinux_load_state *load_state);
-static int call_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
 static bool snapshot_magisk_policy_file(const char *reason, bool try_relative);
 static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, bool allow_fallback);
 static void before_security_load_policy(hook_fargs4_t *a, void *u);
@@ -548,14 +539,15 @@ static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
 static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size);
 static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size);
-static int install_write_op_hooks(void);
+static int install_write_op_hooks(bool allow_slot_fallback);
 static void uninstall_write_op_hooks(void);
+static void record_inline_hook(void *func, void *before, void *after);
 static void uninstall_inline_hooks(void);
 static bool event_is_post_init(const char *event);
 static void try_complete_deferred_write_op_install(const char *reason);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
-static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
-static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
+static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u);
+static bool install_status_page_redirect(void);
 
 /*
  * Patch the seqno field (5th whitespace-separated token, formatted as "%u")
@@ -668,6 +660,22 @@ static void copy_av_decision(struct av_decision *dst, const struct av_decision *
     dst->auditdeny = src->auditdeny;
     dst->seqno = src->seqno;
     dst->flags = src->flags;
+}
+
+static size_t runtime_page_size(void)
+{
+    uint64_t tcr_el1;
+    uint64_t tg1;
+
+    /* Match KernelPatch's runtime page-size detection for the TTBR1 range. */
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
+    tg1 = (tcr_el1 >> 30) & 0x3;
+
+    if (tg1 == 1)
+        return 16 * 1024;
+    if (tg1 == 3)
+        return 64 * 1024;
+    return 4 * 1024;
 }
 
 static int copy_status_to_user(void __user *dst, const void *src, size_t len)
@@ -877,7 +885,12 @@ static bool selinux_compat_call_needed(void)
      * common stateful era, and stop before the newer 6.4+ LSM refactors where
      * this KPM has not been audited.
      */
-	return g_selinux_state && kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
+	return g_selinux_state && selinux_state_arg_required();
+}
+
+static bool selinux_state_arg_required(void)
+{
+    return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
 }
 
 static bool policydb_offset_fallback_allowed(void)
@@ -898,11 +911,10 @@ static bool policydb_offset_fallback_allowed(void)
 static bool write_op_slot_fallback_allowed(void)
 {
     /*
-     * Keep the c02-compatible 4.14 behavior from the last commit: do not patch
-     * write_op[] on 4.14-or-older kernels.  For newer kernels, preserve the
-     * pre-merge fallback when sel_write_access() is not directly resolvable.
+     * The audited stateful 4.14 layout has the same context/access slots as
+     * newer kernels. Keep unknown legacy layouts on the direct-symbol path.
      */
-    return !selinux_414_compat_path();
+    return !use_legacy_clean_blob_query() || g_selinux_state;
 }
 
 static bool security_setprocattr_has_lsm_arg(void)
@@ -956,6 +968,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("__copy_to_user"),
     SYMBOL_CACHE_ENTRY("vmalloc"),
     SYMBOL_CACHE_ENTRY("vmalloc_noprof"),
+    SYMBOL_CACHE_ENTRY("vmalloc_to_page"),
     SYMBOL_CACHE_ENTRY("vfree"),
     SYMBOL_CACHE_ENTRY("filp_open"),
     SYMBOL_CACHE_ENTRY("filp_close"),
@@ -973,13 +986,11 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
     SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
     SYMBOL_CACHE_ENTRY("selinux_policy_cancel"),
-    SYMBOL_CACHE_ENTRY("sidtab_cancel_convert"),
     SYMBOL_CACHE_ENTRY("security_read_policy"),
     SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
     SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
-    SYMBOL_CACHE_ENTRY("selinux_status_update_seqlock"),
-    SYMBOL_CACHE_ENTRY("selinux_status_update_policyload"),
+    SYMBOL_CACHE_ENTRY("selinux_kernel_status_page"),
     SYMBOL_CACHE_ENTRY("security_setprocattr"),
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
     SYMBOL_CACHE_ENTRY("sel_write_access"),
@@ -994,6 +1005,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
 #define SYMBOL_CACHE_COUNT (sizeof(g_symbol_cache) / sizeof(g_symbol_cache[0]))
 
 static bool g_symbol_cache_resolved;
+static bool g_symbol_cache_walk_complete;
 
 static size_t str_len_safe(const char *s)
 {
@@ -1124,6 +1136,8 @@ static void resolve_required_symbols_once(void)
     u32 found = 0;
     u32 suffixed = 0;
     u32 missing = 0;
+    int walk_rc = -ENOENT;
+    bool walk_complete = false;
 
     if (READ_ONCE(g_symbol_cache_resolved))
         return;
@@ -1142,12 +1156,12 @@ static void resolve_required_symbols_once(void)
             }
         }
     } else if (kver <= VERSION(6, 1, 0)) {
-        kallsyms_on_each_symbol(cache_symbol_cb, NULL);
+        walk_rc = kallsyms_on_each_symbol(cache_symbol_cb, NULL);
     } else {
         kallsyms_on_each_symbol_nomod_fn on_each_symbol;
 
         on_each_symbol = (kallsyms_on_each_symbol_nomod_fn)kallsyms_on_each_symbol;
-        on_each_symbol(cache_symbol_cb_nomod, NULL);
+        walk_rc = on_each_symbol(cache_symbol_cb_nomod, NULL);
     }
 
 	for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
@@ -1157,6 +1171,7 @@ static void resolve_required_symbols_once(void)
                 suffixed++;
         }
     }
+    walk_complete = walk_rc == 0 && found > 0;
 
     if (found == 0 && kallsyms_on_each_symbol) {
         pr_warn("[selinux_hook] kallsyms_on_each_symbol returned no symbols, falling back to kallsyms_lookup_name\n");
@@ -1183,6 +1198,7 @@ static void resolve_required_symbols_once(void)
         }
     }
 
+    WRITE_ONCE(g_symbol_cache_walk_complete, walk_complete);
     WRITE_ONCE(g_symbol_cache_resolved, true);
     pr_info("[selinux_hook] symbol cache resolved in one pass: found=%u suffixed=%u missing=%u\n",
             found, suffixed, missing);
@@ -1206,7 +1222,7 @@ static struct symbol_cache_entry *find_cached_symbol(const char *base)
 static void *lookup_name_optional_suffix(const char *base)
 {
     struct symbol_cache_entry *entry;
-	unsigned long addr;
+    unsigned long addr;
 
     if (!base)
         return NULL;
@@ -1218,16 +1234,13 @@ static void *lookup_name_optional_suffix(const char *base)
         return (void *)entry->addr;
 
     addr = (unsigned long)kallsyms_lookup_name(base);
-    if (addr) {
-        if (entry) {
-            entry->addr = addr;
-            entry->exact = true;
-            entry->suffixed = false;
-        }
-        return (void *)addr;
+    if (addr && entry) {
+        entry->addr = addr;
+        entry->exact = true;
+        entry->suffixed = false;
     }
 
-    return NULL;
+    return (void *)addr;
 }
 
 /*
@@ -1250,6 +1263,11 @@ static void *lookup_name_numbered_suffix(const char *base)
     u32 n;
 
     if (!base)
+        return NULL;
+
+    resolve_required_symbols_once();
+
+    if (READ_ONCE(g_symbol_cache_walk_complete))
         return NULL;
 
     base_len = str_len_safe(base);
@@ -1300,7 +1318,8 @@ static int call_security_load_policy(void *data, size_t len, struct selinux_load
     if (!security_load_policy_has_load_state())
         return -EOPNOTSUPP;
     if (selinux_compat_call_needed() && security_load_policy_compat_fn)
-        return security_load_policy_compat_fn(g_selinux_state, data, len, load_state);
+        return security_load_policy_compat_fn(g_selinux_state, data, len,
+                                              load_state);
     if (security_load_policy_fn)
         return security_load_policy_fn(data, len, load_state);
     return -ENOENT;
@@ -1314,15 +1333,6 @@ static void call_selinux_policy_cancel(struct selinux_load_state *load_state)
     }
     if (selinux_policy_cancel_fn)
         selinux_policy_cancel_fn(load_state);
-}
-
-static int call_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp)
-{
-    if (selinux_compat_call_needed() && security_context_to_sid_compat_fn)
-        return security_context_to_sid_compat_fn(g_selinux_state, scontext, scontext_len, out_sid, gfp);
-    if (security_context_to_sid_fn)
-        return security_context_to_sid_fn(scontext, scontext_len, out_sid, gfp);
-    return -ENOENT;
 }
 
 static unsigned int ebitmap_start_positive_intel(struct ebitmap *e,
@@ -1545,53 +1555,6 @@ static void *read_load_state_policy(void *load_state)
     return *(void **)load_state;
 }
 
-static struct sidtab *read_policy_sidtab(void *policy)
-{
-    struct sidtab *sidtab = NULL;
-
-    if (!policy)
-        return NULL;
-
-    if (copy_from_kernel_nofault_fn &&
-        copy_from_kernel_nofault_fn(&sidtab, policy, sizeof(sidtab)) == 0)
-        return sidtab;
-
-    return *(struct sidtab **)policy;
-}
-
-static void cancel_clean_sidtab_convert(const char *reason)
-{
-    void *policy;
-    struct sidtab *sidtab;
-
-    if (!READ_ONCE(g_clean_load_state_ready))
-        return;
-    if (READ_ONCE(g_clean_sidtab_convert_canceled))
-        return;
-
-    policy = READ_ONCE(g_first_policy);
-    if (!policy)
-        return;
-
-    if (!sidtab_cancel_convert_fn) {
-        pr_warn("[selinux_hook] CLEAN cannot cancel live sidtab convert reason=%s: missing sidtab_cancel_convert\n",
-                reason ?: "(null)");
-        return;
-    }
-
-    sidtab = read_policy_sidtab(policy);
-    if (!sidtab) {
-        pr_warn("[selinux_hook] CLEAN cannot cancel live sidtab convert reason=%s policy=%px sidtab=NULL\n",
-                reason ?: "(null)", policy);
-        return;
-    }
-
-    sidtab_cancel_convert_fn(sidtab);
-    WRITE_ONCE(g_clean_sidtab_convert_canceled, true);
-    selinux_hook_dbg("[selinux_hook] CLEAN canceled live sidtab convert reason=%s policy=%px sidtab=%px clean_policy=%px\n",
-                     reason ?: "(null)", policy, sidtab, g_clean_load_state.policy);
-}
-
 static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count, loff_t *pos)
 {
     if (!kernel_read_fn)
@@ -1811,6 +1774,12 @@ static void activate_clean_policy_blob(const char *reason)
         return;
     }
 
+    if (!READ_ONCE(g_clean_policydb)) {
+        try_load_clean_policydb_from_blob(reason);
+        if (READ_ONCE(g_clean_policydb))
+            return;
+    }
+
     if (!security_load_policy_has_load_state()) {
         try_load_clean_policydb_from_blob(reason);
         pr_info("[selinux_hook] CLEAN policy load skipped reason=%s: legacy security_load_policy commits live policy, blob fallback active\n",
@@ -1829,7 +1798,6 @@ static void activate_clean_policy_blob(const char *reason)
         if (!rc && g_clean_load_state.policy) {
             WRITE_ONCE(g_clean_load_state_ready, true);
             refresh_clean_policydb("clean_load", false);
-            cancel_clean_sidtab_convert("clean_load");
             selinux_hook_dbg("[selinux_hook] CLEAN policy loaded policy=%px policydb=%px convert=%px\n",
                              g_clean_load_state.policy, READ_ONCE(g_clean_policydb),
                              g_clean_load_state.convert_data);
@@ -2596,30 +2564,22 @@ static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
 {
     const char *ctx;
     size_t len;
-    int rc;
 
     if (!query || !out_sid)
         return -EINVAL;
-
-    refresh_clean_policydb("procattr_current", true);
-    if (!READ_ONCE(g_clean_policydb) ||
-        (!security_context_to_sid_fn && !security_context_to_sid_compat_fn))
-        return 1;
-    if (!clean_policydb_redirect_supported())
-        return 1;
 
     ctx = skip_spaces(query);
     len = token_len(ctx);
     if (!len)
         return -EINVAL;
 
-    if (!enter_clean_eval_scope())
-        return -EAGAIN;
+    if (!READ_ONCE(g_clean_policy_blob))
+        return 1; /* 没有可用的 clean blob，交给上层走别的判断 */
 
-    rc = call_security_context_to_sid(ctx, (u32)len, out_sid, (gfp_t)0);
-    leave_clean_eval_scope();
+    if (out_sid)
+        *out_sid = 0;
 
-    return rc;
+    return clean_context_exists(ctx) ? 0 : -EINVAL;
 }
 
 /* Hook: selinux_complete_init */
@@ -2632,15 +2592,27 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
 }
 
 /* Hook: selinux_policy_commit */
-static void after_selinux_policy_commit(hook_fargs1_t *a, void *u)
+static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
 {
-    void *policy = read_load_state_policy((void *)a->arg0);
+    void *load_state = selinux_compat_call_needed() ? (void *)a->arg1
+                                                   : (void *)a->arg0;
+    void *policy = read_load_state_policy(load_state);
+    void *first_policy = READ_ONCE(g_first_policy);
 
     WRITE_ONCE(g_selinux_ready, true);
-    if (policy && !READ_ONCE(g_first_policy))
+
+    if (policy && !first_policy) {
         WRITE_ONCE(g_first_policy, policy);
+    } else if (policy && policy != first_policy) {
+        if (READ_ONCE(g_policydb_offset)) {
+            WRITE_ONCE(g_first_policy, NULL);
+        } else {
+            WRITE_ONCE(g_first_policy, NULL);
+            WRITE_ONCE(g_first_policydb, NULL);
+        }
+    }
+
     refresh_clean_policydb("policy_commit", false);
-    cancel_clean_sidtab_convert("policy_commit");
     selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policy=%px first policydb=%px clean policydb=%px\n",
                      g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
@@ -2649,12 +2621,10 @@ static void after_selinux_policy_commit(hook_fargs1_t *a, void *u)
 
 /*
  * Determine whether the current KP event is past the pre-kernel-init stage.
- * sel_write_access / sel_write_context inline hooks must NOT be installed
- * during pre-kernel-init: the kernel's selinux_complete_init() will re-patch
- * write_op[] afterwards and overwrite/corrupt our hook pointers, which on
- * v1.1.4 led to execve -> ext4_lookup -> blk_mq pointer corruption Oops
- * (and on MTK platforms manifests as display freeze / panic on SELinux
- * access).  We defer installation until SELinux is ready.
+ * write_op[] slot hooks must not be installed during pre-kernel-init: the
+ * kernel's selinux_complete_init() can rewrite that table afterwards. Direct
+ * inline hooks target function text and are safe to install immediately; only
+ * the pointer-table fallback is deferred until SELinux is ready.
  */
 static bool event_is_post_init(const char *event)
 {
@@ -2694,7 +2664,12 @@ static void try_complete_deferred_write_op_install(const char *reason)
         return;
 
     WRITE_ONCE(g_write_op_install_deferred, false);
-    rc = install_write_op_hooks();
+    rc = install_write_op_hooks(true);
+    if (rc == -EOPNOTSUPP) {
+        pr_warn("[selinux_hook] deferred write_op slot hooks unavailable reason=%s\n",
+                reason ? reason : "(null)");
+        return;
+    }
     if (rc) {
         /* Restore the deferred flag so a later policy_commit can retry. */
         WRITE_ONCE(g_write_op_install_deferred, true);
@@ -2785,15 +2760,15 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
 {
     struct av_decision *avd;
 
-    if (!a->local.data0)
-        return;
+    if (a->local.data0) {
+        avd = (struct av_decision *)a->local.data1;
+        if (avd) {
+            WRITE_ONCE(avd->seqno, SELINUX_STATUS_CLEAN_SEQUENCE);
+            WRITE_ONCE(avd->flags, (u32)a->local.data3);
+        }
+    }
 
-    avd = (struct av_decision *)a->local.data1;
-    if (!avd)
-        return;
-
-    WRITE_ONCE(avd->seqno, SELINUX_STATUS_CLEAN_SEQUENCE);
-    WRITE_ONCE(avd->flags, (u32)a->local.data3);
+    try_complete_deferred_write_op_install("context_struct_compute_av");
 }
 
 static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
@@ -3285,11 +3260,16 @@ static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t siz
                                    before_sel_write_context, file, buf, size);
 }
 
-static int install_write_op_hooks(void)
+static int install_write_op_hooks(bool allow_slot_fallback)
 {
     unsigned long addr_access, addr_context;
     sel_write_op_fn *write_op;
+    hook_err_t hook_err;
     int rc;
+
+    if (READ_ONCE(g_write_op_access_patched) ||
+        READ_ONCE(g_write_op_context_patched))
+        return 0;
 
     /* Prefer direct symbol lookup; fall back to LLVM-suffix variant */
     addr_access = (unsigned long)lookup_name_optional_suffix("sel_write_access");
@@ -3303,6 +3283,9 @@ static int install_write_op_hooks(void)
      * SEL_CONTEXT/SEL_ACCESS slots from the 4.9 selinuxfs layout.
      */
     if (selinux_49_compat_path()) {
+        if (!allow_slot_fallback)
+            return -EAGAIN;
+
         write_op = (sel_write_op_fn *)lookup_name_optional_suffix("write_op");
         log_symbol_addr("write_op", write_op);
         if (!write_op) {
@@ -3346,21 +3329,49 @@ static int install_write_op_hooks(void)
 
     /* Non-4.9 / 非 4.9：保持原来的 direct-symbol-first hook 顺序。 */
     if (addr_access) {
-        g_funcs[g_hooks++] = (void *)addr_access;
+        if (g_hooks + (addr_context ? 2 : 1) >
+            (int)(sizeof(g_funcs) / sizeof(g_funcs[0])))
+            return -ENOSPC;
+
         pr_info("[selinux_hook] hook sel_write_access argc=3 mode=direct\n");
-        hook_wrap((void *)addr_access, 3, before_sel_write_access, after_sel_write_common, NULL);
+        hook_err = hook_wrap((void *)addr_access, 3, before_sel_write_access,
+                             after_sel_write_common, NULL);
+        if (hook_err != HOOK_NO_ERR) {
+            pr_err("[selinux_hook] hook sel_write_access failed err=%d\n",
+                   (int)hook_err);
+            return (int)hook_err;
+        }
+        record_inline_hook((void *)addr_access, before_sel_write_access,
+                           after_sel_write_common);
         selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
 
         if (addr_context) {
-            g_funcs[g_hooks++] = (void *)addr_context;
             pr_info("[selinux_hook] hook sel_write_context argc=3 mode=direct\n");
-            hook_wrap((void *)addr_context, 3, before_sel_write_context, after_sel_write_common, NULL);
+            hook_err = hook_wrap((void *)addr_context, 3,
+                                 before_sel_write_context,
+                                 after_sel_write_common, NULL);
+            if (hook_err != HOOK_NO_ERR) {
+                pr_err("[selinux_hook] hook sel_write_context failed err=%d\n",
+                       (int)hook_err);
+                hook_unwrap((void *)addr_access, before_sel_write_access,
+                            after_sel_write_common);
+                g_hooks--;
+                g_funcs[g_hooks] = NULL;
+                g_hook_befores[g_hooks] = NULL;
+                g_hook_afters[g_hooks] = NULL;
+                return (int)hook_err;
+            }
+            record_inline_hook((void *)addr_context, before_sel_write_context,
+                               after_sel_write_common);
             selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
         } else {
             pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
         }
         return 0;
     }
+
+    if (!allow_slot_fallback)
+        return -EAGAIN;
 
     /*
      * write_op[] fallback notes:
@@ -3376,20 +3387,14 @@ static int install_write_op_hooks(void)
      *   KP E unknown symbol: hotpatch_nosync
      *   KP load kpm: selinux_magisk_access_filter, rc: -2
      *
-     * 这不是 SELinux hook 逻辑失败，而是 KPM loader 在重定位阶段就找不到
-     * hotpatch_nosync，导致 init() 都不会执行。为了让模块至少能加载并打印
-     * 诊断，本分支完全避免静态导入 hotpatch_nosync；如果 direct symbol
-     * 不存在，就记录降级原因，而不是再尝试写 write_op[]。
-     *
-     * That failure happens before module init(), so this c02-compatible build
-     * deliberately avoids importing hotpatch_nosync at all.  If direct symbols
-     * are absent, log the downgrade and keep the KPM loaded for diagnostics
-     * instead of failing relocation.
+     * This build avoids importing hotpatch_nosync so it can still load on c02.
+     * The fallback below patches only the audited write_op slots through the
+     * local page-table helper after SELinux initialization has completed.
      */
     if (!write_op_slot_fallback_allowed()) {
-        pr_warn("[selinux_hook] sel_write_access unresolved; keep 4.14 compatibility path and skip write_op[%d/%d] fallback kver=%x\n",
+        pr_warn("[selinux_hook] sel_write_access unresolved; no audited write_op[%d/%d] fallback kver=%x\n",
                 SEL_WRITE_OP_CONTEXT, SEL_WRITE_OP_ACCESS, kver);
-        return 0;
+        return -EOPNOTSUPP;
     }
 
     write_op = (sel_write_op_fn *)lookup_name_optional_suffix("write_op");
@@ -3457,12 +3462,20 @@ static void uninstall_write_op_hooks(void)
     g_orig_write_op_access = NULL;
 }
 
+static void record_inline_hook(void *func, void *before, void *after)
+{
+    g_funcs[g_hooks] = func;
+    g_hook_befores[g_hooks] = before;
+    g_hook_afters[g_hooks] = after;
+    g_hooks++;
+}
+
 static void uninstall_inline_hooks(void)
 {
     int i;
 
     for (i = 0; i < g_hooks; i++)
-        unhook(g_funcs[i]);
+        hook_unwrap(g_funcs[i], g_hook_befores[i], g_hook_afters[i]);
     g_hooks = 0;
 }
 
@@ -3485,15 +3498,15 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
 
     sample[0] = '\0';
     sample_len = value && size ? copy_query_sample(sample, (const char *)value, size) : 0;
-	/*
+
+    uid = current_uid();
+    manager = should_bypass_clean_filter(uid);
+
+    /*
      * 4.9 setprocattr path / 4.9 setprocattr 路径：
      * avoid clean policydb helpers with device-specific ABI; only block known
      * DirtySepolicy probes while allowing manager/root callers through.
      */
-	 
-	uid = current_uid();
-	manager = should_bypass_clean_filter(uid);
-	 
     if (selinux_49_compat_path()) {
         if (!manager && (dirtysepolicy_context_should_hide(sample) ||
                          legacy_should_block_access_query(sample, sample_len)))
@@ -3521,16 +3534,9 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
             clean_ret = clean_policy_context_to_sid(sample, &clean_sid);
             clean_checked = clean_ret <= 0;
         }
-        if (clean_ret == 1 && READ_ONCE(g_clean_policy_blob)) {
-            clean_checked = true;
-            clean_ret = clean_context_exists(sample) ? 0 : -EINVAL;
-        } else if (clean_ret == 1) {
-            clean_ret = 0;
-        }
     }
     blocked = !manager && clean_ret == -EINVAL;
 
-    uid = current_uid();
     n = READ_ONCE(g_procattr_current_count) + 1;
     WRITE_ONCE(g_procattr_current_count, n);
 
@@ -3770,34 +3776,87 @@ static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u)
 }
 
 /*
- * Hook: selinux_status_update_seqlock
- *
- * Prevents the kernel from updating the sequence field in the status page.
- * Old kernels (< 6.6): detection expects sequence=0 policyload=0 (initial state).
- * Skip the update entirely so the status page stays frozen at 0/0.
- *
- * Kernel < 5.19: selinux_status_update_seqlock(struct selinux_state *state)  argc=1
- * Kernel >= 5.19: selinux_status_update_seqlock(void)                        argc=0
+ * Return a clean backing page when an app opens /sys/fs/selinux/status.
+ * sel_open_handle_status() stores selinux_kernel_status_page()'s return value
+ * in filp->private_data, so redirecting the page factory covers both the read
+ * and mmap paths without relying on any private structure offsets.
  */
-static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u)
+static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u)
 {
-    if (kver < VERSION(6, 6, 0))
-        a->skip_origin = 1;
+    void *page;
+
+    if (should_bypass_clean_filter(current_uid()))
+        return;
+
+    if (!g_fake_status_page || !vmalloc_to_page_fn)
+        return;
+
+    page = vmalloc_to_page_fn(g_fake_status_page);
+    if (!page)
+        return;
+
+    a->ret = (uint64_t)page;
+    a->skip_origin = 1;
 }
 
-/*
- * Hook: selinux_status_update_policyload
- *
- * Prevents the policyload counter in the status page from incrementing.
- *
- * Kernel < 5.19: selinux_status_update_policyload(state, seqno)  argc=2
- * Kernel >= 5.19: selinux_status_update_policyload(seqno)        argc=1
- */
-static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u)
+static bool install_status_page_redirect(void)
 {
-    if (kver < VERSION(6, 6, 0))
-        a->skip_origin = 1;
+    unsigned long addr;
+    hook_err_t err;
+    void *page;
+    size_t fake_page_size = runtime_page_size();
+
+    if (READ_ONCE(g_status_page_redirect_hooked))
+        return true;
+
+    if (!vmalloc_fn || !vmalloc_to_page_fn) {
+        pr_warn("[selinux_hook] status page redirect unavailable vmalloc=%px vmalloc_to_page=%px\n",
+                vmalloc_fn, vmalloc_to_page_fn);
+        return false;
+    }
+
+    if (!g_fake_status_page) {
+        g_fake_status_page = vmalloc_fn(fake_page_size);
+        if (!g_fake_status_page) {
+            pr_warn("[selinux_hook] fake status page allocation failed size=%zu\n",
+                    fake_page_size);
+            return false;
+        }
+        zero_bytes(g_fake_status_page, fake_page_size);
+        copy_bytes(g_fake_status_page, g_clean_status_bytes,
+                   sizeof(g_clean_status_bytes));
+    }
+
+    page = vmalloc_to_page_fn(g_fake_status_page);
+    if (!page) {
+        pr_warn("[selinux_hook] cannot translate fake status page to struct page\n");
+        return false;
+    }
+
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_kernel_status_page");
+    if (!addr) {
+        pr_warn("[selinux_hook] cannot find selinux_kernel_status_page\n");
+        return false;
+    }
+
+    /* Both void(void) and stateful page-factory ABIs are safe through the
+     * four-register transit: a state argument remains in x0 when present,
+     * while a void function ignores it. */
+    err = hook_wrap((void *)addr, 1, before_selinux_kernel_status_page,
+                    NULL, NULL);
+    if (err != HOOK_NO_ERR) {
+        pr_warn("[selinux_hook] hook selinux_kernel_status_page failed err=%d\n",
+                (int)err);
+        return false;
+    }
+
+    record_inline_hook((void *)addr, before_selinux_kernel_status_page, NULL);
+    WRITE_ONCE(g_status_page_redirect_hooked, true);
+    pr_info("[selinux_hook] status page redirect installed factory=%px fake_page=%px backing=%px size=%zu\n",
+            (void *)addr, g_fake_status_page, page, fake_page_size);
+    return true;
 }
+
 static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
 {
     uid_t uid = current_uid();
@@ -3988,40 +4047,13 @@ static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data
         return;
     }
 
-    /* Cache hit: a previous reader already vfree'd-into-cache for this
-     * exact source pointer.  Reuse the cached vmalloc buffer — no fresh
-     * allocation, no leak. */
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_policy_cache_lock);
-    if (g_policy_read_cache && g_policy_read_cache_src == snapshot &&
-        g_policy_read_cache_len == len) {
-        copy = g_policy_read_cache;
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_policy_cache_lock);
-    } else {
-        void *stale = g_policy_read_cache;
-
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_policy_cache_lock);
-
-        copy = vmalloc_fn(len);
-        if (!copy) {
-            pr_warn("[selinux_hook] CLEAN policy read copy alloc failed len=%zu\n", len);
-            return;
-        }
-        copy_bytes(copy, snapshot, len);
-
-        if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_policy_cache_lock);
-        g_policy_read_cache = copy;
-        g_policy_read_cache_len = len;
-        g_policy_read_cache_src = snapshot;
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_policy_cache_lock);
-
-        if (stale && vfree_fn)
-            vfree_fn(stale);
+    copy = vmalloc_fn(len);
+    if (!copy) {
+        pr_warn("[selinux_hook] CLEAN policy read copy alloc failed len=%zu; fallback=live\n",
+                len);
+        return;
     }
+    copy_bytes(copy, snapshot, len);
 
     *out_data = copy;
     *out_len = len;
@@ -4097,6 +4129,7 @@ static long init(const char *args, const char *event, void *__user r)
     vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc");
     if (!vmalloc_fn)
         vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc_noprof");
+    vmalloc_to_page_fn = (void *)lookup_name_optional_suffix("vmalloc_to_page");
     vfree_fn = (void *)lookup_name_optional_suffix("vfree");
     filp_open_fn = (void *)lookup_name_optional_suffix("filp_open");
     filp_close_fn = (void *)lookup_name_optional_suffix("filp_close");
@@ -4120,7 +4153,6 @@ static long init(const char *args, const char *event, void *__user r)
     type_attribute_bounds_av_fn = (void *)lookup_name_optional_suffix("type_attribute_bounds_av");
     selinux_policy_cancel_fn = (void *)lookup_name_optional_suffix("selinux_policy_cancel");
     selinux_policy_cancel_compat_fn = (void *)selinux_policy_cancel_fn;
-    sidtab_cancel_convert_fn = (void *)lookup_name_optional_suffix("sidtab_cancel_convert");
     security_read_policy_fn = (void *)lookup_name_optional_suffix("security_read_policy");
     security_read_policy_compat_fn = (void *)security_read_policy_fn;
     log_symbol_addr("selinux_state", g_selinux_state);
@@ -4135,7 +4167,6 @@ static long init(const char *args, const char *event, void *__user r)
     log_symbol_addr("constraint_expr_eval", (void *)constraint_expr_eval_fn);
     log_symbol_addr("type_attribute_bounds_av", (void *)type_attribute_bounds_av_fn);
     log_symbol_addr("selinux_policy_cancel", (void *)selinux_policy_cancel_fn);
-    log_symbol_addr("sidtab_cancel_convert", (void *)sidtab_cancel_convert_fn);
     pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d policydb_offset_fallback=%d write_op_fallback=%d load_state=%d\n",
             selinux_compat_call_needed() ? 1 : 0,
             clean_policydb_redirect_supported() ? 1 : 0,
@@ -4145,8 +4176,6 @@ static long init(const char *args, const char *event, void *__user r)
     if (selinux_compat_call_needed())
         pr_info("[selinux_hook] SELinux compat calls enabled kver=%x state=%px\n",
                 kver, g_selinux_state);
-    if (!sidtab_cancel_convert_fn)
-        pr_warn("[selinux_hook] cannot find sidtab_cancel_convert, clean snapshot may leave live policy busy\n");
 	/*
      * 4.9 security_read_policy ABI is vendor-specific / 4.9 该 helper ABI 依机型变化：
      * skip snapshot and hook on 4.9; non-4.9 keeps the existing clean-policy path.
@@ -4182,12 +4211,16 @@ static long init(const char *args, const char *event, void *__user r)
         if (!selinux_49_compat_path()) {
             int argc = selinux_compat_call_needed() ? 3 : 2;
 
-            g_funcs[g_hooks++] = (void *)security_read_policy_fn;
             pr_info("[selinux_hook] hook security_read_policy argc=%d\n", argc);
-            if (selinux_compat_call_needed())
+            if (selinux_compat_call_needed()) {
+                record_inline_hook((void *)security_read_policy_fn,
+                                   before_security_read_policy_compat, NULL);
                 hook_wrap((void *)security_read_policy_fn, 3, before_security_read_policy_compat, NULL, NULL);
-            else
+            } else {
+                record_inline_hook((void *)security_read_policy_fn,
+                                   before_security_read_policy, NULL);
                 hook_wrap((void *)security_read_policy_fn, 2, before_security_read_policy, NULL, NULL);
+            }
         } else {
             pr_info("[selinux_hook] skip security_read_policy hook on 4.9: helper ABI is device-specific\n");
         }
@@ -4195,7 +4228,8 @@ static long init(const char *args, const char *event, void *__user r)
 
     addr = (unsigned long)lookup_name_optional_suffix("simple_read_from_buffer");
     if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
+        record_inline_hook((void *)addr, before_simple_read_from_buffer,
+                           after_simple_read_from_buffer);
         WRITE_ONCE(g_simple_read_from_buffer_hooked, true);
         selinux_hook_dbg("[selinux_hook] hook simple_read_from_buffer argc=5 for status patch\n");
         hook_wrap((void *)addr, 5, before_simple_read_from_buffer,
@@ -4206,7 +4240,8 @@ static long init(const char *args, const char *event, void *__user r)
 
     addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
     if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
+        record_inline_hook((void *)addr, before_sel_read_handle_status,
+                           after_sel_read_handle_status);
         selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4\n");
         hook_wrap((void *)addr, 4, before_sel_read_handle_status,
                   after_sel_read_handle_status, NULL);
@@ -4214,37 +4249,22 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find sel_read_handle_status, status read hook skipped\n");
     }
 
-    /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
-    addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
-    if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
-        hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
-    } else {
-        pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
-    }
+    bool status_page_redirect = false;
+    status_page_redirect = install_status_page_redirect();
+    if (status_page_redirect) pr_info("[selinux_hook] status page redirect successfully\n");
+    else pr_warn("[selinux_hook] status page redirect failed\n");
 
-    /* Freeze status page sequence/policyload on old kernels */
-    addr = (unsigned long)lookup_name_optional_suffix("selinux_status_update_seqlock");
-    if (addr) {
-        /* argc=1 on < 5.19 (state arg), argc=0 on >= 5.19 */
-        int argc = (kver < VERSION(5, 19, 0)) ? 1 : 0;
-        g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook selinux_status_update_seqlock argc=%d kver=%x\n", argc, kver);
-        hook_wrap((void *)addr, argc, before_selinux_status_update_seqlock, NULL, NULL);
-    } else {
-        pr_warn("[selinux_hook] cannot find selinux_status_update_seqlock\n");
-    }
-
-    addr = (unsigned long)lookup_name_optional_suffix("selinux_status_update_policyload");
-    if (addr) {
-        /* argc=2 on < 5.19 (state, seqno), argc=1 on >= 5.19 (seqno) */
-        int argc = (kver < VERSION(5, 19, 0)) ? 2 : 1;
-        g_funcs[g_hooks++] = (void *)addr;
-        selinux_hook_dbg("[selinux_hook] hook selinux_status_update_policyload argc=%d kver=%x\n", argc, kver);
-        hook_wrap((void *)addr, argc, before_selinux_status_update_policyload, NULL, NULL);
-    } else {
-        pr_warn("[selinux_hook] cannot find selinux_status_update_policyload\n");
+    if(status_page_redirect == false)
+    {
+        /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
+        addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
+        if (addr) {
+            record_inline_hook((void *)addr, NULL, after_sel_mmap_handle_status);
+            selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
+            hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
+        } else {
+            pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
+        }
     }
 
     if (!security_load_policy_fn) {
@@ -4252,7 +4272,9 @@ static long init(const char *args, const char *event, void *__user r)
     } else if (!READ_ONCE(g_clean_policy_blob)) {
         int argc = selinux_compat_call_needed() ? 4 : 3;
 
-        g_funcs[g_hooks++] = (void *)security_load_policy_fn;
+        record_inline_hook((void *)security_load_policy_fn,
+                           before_security_load_policy,
+                           after_security_load_policy);
         pr_info("[selinux_hook] hook security_load_policy argc=%d for deferred Magisk policy capture\n", argc);
         hook_wrap((void *)security_load_policy_fn, argc,
                   before_security_load_policy, after_security_load_policy, NULL);
@@ -4264,19 +4286,24 @@ static long init(const char *args, const char *event, void *__user r)
 	addr = (unsigned long)lookup_name_optional_suffix("security_setprocattr");
     if (addr) {
         if (selinux_49_compat_path()) {
-            g_funcs[g_hooks++] = (void *)addr;
+            record_inline_hook((void *)addr,
+                               before_security_setprocattr_task_49, NULL);
             selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=4 mode=task 4.9\n");
             hook_wrap((void *)addr, 4, before_security_setprocattr_task_49, NULL, NULL);
         } else {
             bool setprocattr_lsm_arg = security_setprocattr_has_lsm_arg();
 
-            g_funcs[g_hooks++] = (void *)addr;
             selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=%d\n",
                              setprocattr_lsm_arg ? 4 : 3);
-            if (setprocattr_lsm_arg)
+            if (setprocattr_lsm_arg) {
+                record_inline_hook((void *)addr, before_security_setprocattr,
+                                   NULL);
                 hook_wrap((void *)addr, 4, before_security_setprocattr, NULL, NULL);
-            else
+            } else {
+                record_inline_hook((void *)addr,
+                                   before_security_setprocattr_legacy, NULL);
                 hook_wrap((void *)addr, 3, before_security_setprocattr_legacy, NULL, NULL);
+            }
         }
     } else {
         pr_warn("[selinux_hook] cannot find security_setprocattr\n");
@@ -4285,11 +4312,12 @@ static long init(const char *args, const char *event, void *__user r)
     addr = (unsigned long)lookup_name_optional_suffix("selinux_setprocattr");
     if (addr) {
         if (selinux_49_compat_path()) {
-            g_funcs[g_hooks++] = (void *)addr;
+            record_inline_hook((void *)addr,
+                               before_selinux_setprocattr_task_49, NULL);
             selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=4 mode=task 4.9\n");
             hook_wrap((void *)addr, 4, before_selinux_setprocattr_task_49, NULL, NULL);
         } else {
-            g_funcs[g_hooks++] = (void *)addr;
+            record_inline_hook((void *)addr, before_selinux_setprocattr, NULL);
             selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3\n");
             hook_wrap((void *)addr, 3, before_selinux_setprocattr, NULL, NULL);
         }
@@ -4297,16 +4325,17 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
     }
 
-    if (event_is_post_init(event) || READ_ONCE(g_selinux_ready)) {
-        rc = install_write_op_hooks();
-        if (rc) {
-            uninstall_inline_hooks();
-            return rc;
-        }
-    } else {
-        pr_info("[selinux_hook] deferring install_write_op_hooks until SELinux ready (event=%s)\n",
+    rc = install_write_op_hooks(event_is_post_init(event) ||
+                                READ_ONCE(g_selinux_ready));
+    if (rc == -EAGAIN) {
+        pr_info("[selinux_hook] deferring write_op slot hooks until SELinux ready (event=%s)\n",
                 event ? event : "(null)");
         WRITE_ONCE(g_write_op_install_deferred, true);
+    } else if (rc == -EOPNOTSUPP) {
+        pr_warn("[selinux_hook] write_op slot hooks unavailable; continuing without access/context fallback\n");
+    } else if (rc) {
+        uninstall_inline_hooks();
+        return rc;
     }
 
     /*
@@ -4321,12 +4350,15 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip context_struct_compute_av on 4.9: helper ABI is device-specific\n");
         } else if (clean_policydb_redirect_supported()) {
-            g_funcs[g_hooks++] = (void *)addr;
+            record_inline_hook((void *)addr,
+                               before_context_struct_compute_av_policydb,
+                               after_context_struct_compute_av_policydb);
             pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
             hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
                       after_context_struct_compute_av_policydb, NULL);
         } else {
-            g_funcs[g_hooks++] = (void *)addr;
+            record_inline_hook((void *)addr,
+                               before_context_struct_compute_av_legacy, NULL);
             pr_info("[selinux_hook] hook legacy context_struct_compute_av argc=5\n");
             hook_wrap((void *)addr, 5, before_context_struct_compute_av_legacy, NULL, NULL);
 			WRITE_ONCE(g_hook_context_compute_av_ok, true); // Mark legacy AV hook mounted successfully, used to identify the working mode
@@ -4340,7 +4372,7 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip string_to_context_struct on 4.9: helper ABI is device-specific\n");
         } else if (clean_policydb_redirect_supported()) {
-            g_funcs[g_hooks++] = (void *)addr;
+            record_inline_hook((void *)addr, before_policydb_arg0, NULL);
             pr_info("[selinux_hook] hook string_to_context_struct argc=5\n");
             hook_wrap((void *)addr, 5, before_policydb_arg0, NULL, NULL);
         } else {
@@ -4355,7 +4387,7 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip selinux_complete_init on 4.9: helper ABI is device-specific\n");
         } else {
-            g_funcs[g_hooks++] = (void *)addr;
+            record_inline_hook((void *)addr, NULL, after_selinux_complete_init);
             pr_info("[selinux_hook] hook selinux_complete_init argc=0\n");
             hook_wrap((void *)addr, 0, NULL, after_selinux_complete_init, NULL);
         }
@@ -4368,9 +4400,12 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip selinux_policy_commit on 4.9: helper ABI is device-specific\n");
         } else {
-            g_funcs[g_hooks++] = (void *)addr;
-            pr_info("[selinux_hook] hook selinux_policy_commit argc=1\n");
-            hook_wrap((void *)addr, 1, NULL, after_selinux_policy_commit, NULL);
+            int argc = selinux_compat_call_needed() ? 2 : 1;
+
+            record_inline_hook((void *)addr, NULL, after_selinux_policy_commit);
+            pr_info("[selinux_hook] hook selinux_policy_commit argc=%d mode=%s\n",
+                    argc, selinux_compat_call_needed() ? "state+load_state" : "load_state");
+            hook_wrap((void *)addr, argc, NULL, after_selinux_policy_commit, NULL);
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_policy_commit\n");
@@ -4385,6 +4420,24 @@ static long exit_(void *__user r)
     WRITE_ONCE(g_write_op_install_deferred, false);
     uninstall_write_op_hooks();
     uninstall_inline_hooks();
+
+    /*
+     * The fake page is returned through selinux_kernel_status_page() and may
+     * still be referenced by already-open status files or VMAs.  Freeing it
+     * here prevents a persistent vmalloc leak, but deliberately accepts the
+     * resulting stale-reference/UAF risk during module unload.
+     */
+    if (g_fake_status_page) {
+        pr_warn("[selinux_hook] UNSAFE: forcing fake SELinux status page free at exit; stale file/VMA references may cause UAF or a kernel crash\n");
+        if (vfree_fn) {
+            vfree_fn(g_fake_status_page);
+            g_fake_status_page = NULL;
+            WRITE_ONCE(g_status_page_redirect_hooked, false);
+        } else {
+            pr_err("[selinux_hook] cannot free fake SELinux status page: vfree is unavailable; vmalloc memory remains allocated\n");
+        }
+    }
+
     g_policy_capture_in_progress = false;
 
     if (READ_ONCE(g_clean_policydb_direct) && g_clean_policydb) {
@@ -4410,14 +4463,6 @@ static long exit_(void *__user r)
             vfree_fn(g_clean_policy_blob);
         g_clean_policy_blob = NULL;
         g_clean_policy_len = 0;
-    }
-
-    if (g_policy_read_cache) {
-        if (vfree_fn)
-            vfree_fn(g_policy_read_cache);
-        g_policy_read_cache = NULL;
-        g_policy_read_cache_len = 0;
-        g_policy_read_cache_src = NULL;
     }
 
     selinux_hook_dbg("[selinux_hook] exited\n");
