@@ -649,6 +649,19 @@ static void zero_bytes(void *dst, size_t len)
         d[i] = 0;
 }
 
+/* Field-wise av_decision copy: avoid *dst = *src which becomes memcpy@plt. */
+static void copy_av_decision(struct av_decision *dst, const struct av_decision *src)
+{
+    if (!dst || !src)
+        return;
+
+    dst->allowed = src->allowed;
+    dst->auditallow = src->auditallow;
+    dst->auditdeny = src->auditdeny;
+    dst->seqno = src->seqno;
+    dst->flags = src->flags;
+}
+
 static size_t runtime_page_size(void)
 {
     uint64_t tcr_el1;
@@ -2783,12 +2796,8 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
                                             tclass, &clean_avd, xperms)) {
             clean_avd.seqno = SELINUX_STATUS_CLEAN_SEQUENCE;
             clean_avd.flags = avd->flags;
-            /* Keep field-wise writes: -O2 can lower struct assignment to memcpy. */
-            avd->allowed = clean_avd.allowed;
-            avd->auditallow = clean_avd.auditallow;
-            avd->auditdeny = clean_avd.auditdeny;
-            avd->seqno = clean_avd.seqno;
-            avd->flags = clean_avd.flags;
+            /* Do not use *avd = clean_avd: -O2 lowers it to memcpy. */
+            copy_av_decision(avd, &clean_avd);
             a->skip_origin = 1;
             return;
         }

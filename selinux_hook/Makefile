@@ -28,7 +28,7 @@ endif
 # Default -O2 is safe after the freestanding-safe copy helpers and
 # hook_local.data3 initialization fixes.  Keep -fno-builtin so ordinary
 # C library names are never assumed; structure copies still must not
-# rely on compiler-emitted memcpy (see copy_bytes and field-wise AV writes).
+# rely on compiler-emitted memcpy (see copy_bytes/copy_av_decision).
 # Override with `make OPT_LEVEL=0` if a toolchain still miscompiles.
 OPT_LEVEL ?= 2
 
